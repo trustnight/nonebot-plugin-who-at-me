@@ -1,166 +1,240 @@
 import time
+import random
 from typing import List
-from nonebot.log import logger
-from nonebot.plugin import on_command, on_message, on_regex, PluginMetadata
-from nonebot.adapters.onebot.v11.event import GroupMessageEvent, MessageEvent
-from nonebot.adapters.onebot.v11.message import Message, MessageSegment
-from nonebot.adapters.onebot.v11.bot import Bot
-from nonebot.exception import ActionFailed
-from nonebot.adapters.onebot.v11.helpers import CHINESE_AGREE_WORD, CHINESE_DECLINE_WORD
-from nonebot.params import EventMessage, ArgPlainText, CommandArg
-from nonebot.permission import SUPERUSER
-from nonebot.matcher import Matcher
-from nonebot import get_driver
+from nonebot import on_message, on_regex, get_driver
+from nonebot.plugin import PluginMetadata
+from nonebot.adapters.onebot.v11 import (
+    Bot,
+    GroupMessageEvent,
+    MessageEvent,
+    MessageSegment,
+    Message,
+)
+from peewee import fn
+
+# =============== 你自己的数据库、工具等 ===============
+from .database import MainTable, db
 from .data_source import extract_member_at
-from .database import MainTable
-from .rule import message_at_rule
-from .utils import node_custom, get_member_name
-from .config import Config
+from .utils import node_custom
+# =====================================================
 
 __plugin_meta__ = PluginMetadata(
     name="who_at_me",
-    description="看看是谁又艾特了我",
-    usage="直接发送 谁@我了？",
+    description="看看是谁又艾特了我（空艾特自动拼接前后，但分别展示）",
+    usage="谁@我了？ / 谁艾特我",
     extra={
-        "author": "SEAFHMC <soku_ritsuki@outlook.com>",
-        "version": "0.3.1",
+        "author": "xxx",
+        "version": "1.0.0",
     },
 )
-plugin_config = Config.parse_obj(get_driver().config)
-reminder_expire_time = (
-    plugin_config.reminder_expire_time * 24 * 3600
-    if plugin_config.reminder_expire_time
-    else 3 * 24 * 3600
-)
 
-monitor = on_message(block=False, rule=message_at_rule)
+global_config = get_driver().config
 
+REMINDER_EXPIRE_TIME = 3 * 24 * 3600  # 超过这个时间就不再显示
+NO_AT_RESPONSES = [
+    "没有人@你，别问了，没人想起你～",
+    "大家都没@你，看来你的存在感比空气还弱……",
+    "没有人@你，不过我可以先@你一下，给你找点存在感～",
+]
 
-async def create_record(bot: Bot, event: GroupMessageEvent, target_id):
-    message = Message()
-    if event.reply:
-        message.append(MessageSegment.reply(event.reply.message_id))
-    for segment in event.message:
-        if segment.type == "at":
-            card = get_member_name(
-                await bot.get_group_member_info(
-                    group_id=event.group_id, user_id=int(target_id)
-                )
-            )
-            message.append(
-                f"@{MessageSegment.text(card)}"
-                if segment.data["qq"] != "all"
-                else "@全体成员"
-            )
-            continue
-        message.append(segment)
+def is_empty_mention(msg_str: str) -> bool:
+    """
+    判断消息是否空艾特：只包含[CQ:at]段，去掉后没任何文字
+    """
+    msg = Message(msg_str)
+    msg_copy = Message(msg)
+    for seg in msg:
+        if seg.type == "at":
+            msg_copy.remove(seg)
+    leftover = str(msg_copy).strip()
+    return len(leftover) == 0
 
-    MainTable.create(
-        operator_id=event.user_id,
-        operator_name=event.sender.card or event.sender.nickname,
-        target_id=target_id,
-        group_id=event.group_id,
-        time=str(int(time.time())),
-        message=message,
-        message_id=event.message_id,
-    )
-
+# ==========================================
+# 1. 监听并存表
+# ==========================================
+monitor = on_message(block=False)
 
 @monitor.handle()
-async def _(bot: Bot, event: GroupMessageEvent, message=EventMessage()):
-    if event.reply:
-        reply_qq = {segment.data["qq"] for segment in event.original_message["at"]}
-        for target_id in reply_qq:
-            await create_record(bot=bot, event=event, target_id=target_id)
-        return
-    member_at = [
-        target_id
-        for target_id in await extract_member_at(
-            event.group_id, message=message, bot=bot
+async def _(bot: Bot, event: GroupMessageEvent):
+    """
+    监听所有群消息：
+      - 若消息包含@xxx => 对每个被@者各插一条(target_id=对方)
+      - 否则插一条(target_id=0)
+    """
+    group_id = event.group_id
+    operator_id = event.user_id
+    operator_name = event.sender.card or event.sender.nickname
+    raw_msg = str(event.message)
+    msg_id = event.message_id
+    now_ts = int(time.time())
+
+    at_members = await extract_member_at(group_id, event.message, bot)
+    if at_members:
+        for target in at_members:
+            MainTable.create(
+                operator_id=operator_id,
+                operator_name=operator_name,
+                target_id=target,
+                group_id=group_id,
+                time=now_ts,
+                message=raw_msg,
+                message_id=msg_id,
+            )
+    else:
+        MainTable.create(
+            operator_id=operator_id,
+            operator_name=operator_name,
+            target_id=0,
+            group_id=group_id,
+            time=now_ts,
+            message=raw_msg,
+            message_id=msg_id,
         )
-        if target_id != str(event.user_id)
-    ]
-    if member_at:
-        for target_id in member_at:
-            await create_record(bot=bot, event=event, target_id=target_id)
-        return
 
 
-who_at_me = on_regex(r"谁.*(@|艾特|圈|[aA][tT])+.?我")
-
+# ==========================================
+# 2. “谁@我” 命令
+# ==========================================
+who_at_me = on_regex(r"^谁.*(@|艾特|圈|[aA][tT])+.?我")
 
 @who_at_me.handle()
 async def _(bot: Bot, event: MessageEvent):
-    res_list: List[MainTable] = MainTable.select().where(
-        MainTable.target_id == event.user_id
+    """
+    查找 target_id=自己 的记录
+    对空艾特 => 取上一条、当前、下一条 分3条节点
+    对带文字@ => 仅当前
+    最后按时间顺序合并
+    """
+    is_group = isinstance(event, GroupMessageEvent)
+    group_id = event.group_id if is_group else None
+    user_id = event.user_id
+    now_ts = int(time.time())
+
+    # 1) 查询所有 @ 我的记录
+    base_query = (
+        MainTable.select()
+        .where(MainTable.target_id == user_id)
+        .where((now_ts - MainTable.time) <= REMINDER_EXPIRE_TIME)  # 未过期
     )
-    message_list: List[MessageSegment] = list()
-    is_group = False
-    for res in res_list:
-        if is_group := isinstance(event, GroupMessageEvent):
-            if res.group_id != event.group_id:
-                continue
-        if time.time() - int(res.time) <= reminder_expire_time:
-            message_list.append(
-                node_custom(
-                    content=res.message,
-                    user_id=res.operator_id,
-                    name=res.operator_name,
-                    time=res.time,
+    if is_group:
+        base_query = base_query.where(MainTable.group_id == group_id)
+
+    # 按时间顺序
+    records = list(base_query.order_by(MainTable.time))
+    if not records:
+        await who_at_me.finish(random.choice(NO_AT_RESPONSES))
+
+    # 2) 汇总所有需要发送的节点
+    #    注意：空艾特 => 上一条/当前/下一条 分别做 3 个节点
+    #          带文字@ => 只做 1 个节点
+    forward_nodes: List[MessageSegment] = []
+
+    for row in records:
+        # 若空艾特
+        if is_empty_mention(row.message):
+            # 拿到上一条、下一条(同群、同人)
+            # 分别做 node
+            prev_row = get_prev_message(row)
+            curr_row = row
+            next_row = get_next_message(row)
+
+            # 可能没有上一条或下一条，这都要判断
+            if prev_row:
+                forward_nodes.append(
+                    make_forward_node(prev_row)
                 )
+            # 当前这条
+            forward_nodes.append(
+                make_forward_node(curr_row)
             )
-    if not message_list:
-        await who_at_me.finish(MessageSegment.reply(event.message_id) + "目前还没有人@您噢！")
+            if next_row:
+                forward_nodes.append(
+                    make_forward_node(next_row)
+                )
+        else:
+            # 带文字@ => 只做单条
+            forward_nodes.append(
+                make_forward_node(row)
+            )
+
+    # 如果最终没有节点
+    if not forward_nodes:
+        await who_at_me.finish(random.choice(NO_AT_RESPONSES))
+
+    # 3) 发送合并转发
     if is_group:
         event: GroupMessageEvent
-        await bot.send_group_forward_msg(group_id=event.group_id, messages=message_list)
+        await bot.send_group_forward_msg(
+            group_id=event.group_id,
+            messages=forward_nodes
+        )
+        # 清空记录(可选)
+        # MainTable.delete().where(
+        #     (MainTable.target_id==user_id) & (MainTable.group_id==group_id)
+        # ).execute()
     else:
-        try:
-            await bot.send_private_forward_msg(
-                user_id=event.user_id, messages=message_list
-            )
-        except ActionFailed as e:
-            if "wording=API不存在" in (error := str(e)):
-                logger.error(
-                    f"发送合并转发失败，请确认您的协议端支持私聊合并转发！(如果使用go-cqhttp，请确保版本号不小于v1.0.0-rc2)\n{error}"
-                )
-            else:
-                raise e
+        await bot.send_private_forward_msg(
+            user_id=event.user_id,
+            messages=forward_nodes
+        )
+        # 清空记录(可选)
+        # MainTable.delete().where(MainTable.target_id==user_id).execute()
 
 
-clear_db = on_command("清除数据库", aliases={"clear_db", "db_clear", "已阅"})
+# ==========================================
+# 3. 查上一条、下一条
+# ==========================================
+def get_prev_message(current_row: MainTable) -> MainTable:
+    """
+    查找同群、同发送者、时间比 current_row 小的消息里，
+    最接近 current_row 的那条(上一条)。
+    """
+    query = (
+        MainTable.select()
+        .where(
+            MainTable.group_id == current_row.group_id,
+            MainTable.operator_id == current_row.operator_id,
+            MainTable.time < current_row.time
+        )
+        .order_by(MainTable.time.desc())
+        .limit(1)
+    )
+    return query.first()
 
 
-@clear_db.handle()
-async def _(event: MessageEvent):
-    if isinstance(event, GroupMessageEvent):
-        MainTable.delete().where(
-            (MainTable.target_id == event.user_id)
-            & (MainTable.group_id == event.group_id)
-        ).execute()
-        await clear_db.finish("已经清除您在本群的被艾特记录！")
-    else:
-        MainTable.delete().where(MainTable.target_id == event.user_id).execute()
-        await clear_db.finish("已经清除您所有的被艾特记录！")
+def get_next_message(current_row: MainTable) -> MainTable:
+    """
+    查找同群、同发送者、时间比 current_row 大的消息里，
+    最接近 current_row 的那条(下一条)。
+    """
+    query = (
+        MainTable.select()
+        .where(
+            MainTable.group_id == current_row.group_id,
+            MainTable.operator_id == current_row.operator_id,
+            MainTable.time > current_row.time
+        )
+        .order_by(MainTable.time.asc())
+        .limit(1)
+    )
+    return query.first()
 
 
-clear_db_all = on_command(
-    "清除全部数据库", aliases={"clear_all", "db_clear --purge"}, permission=SUPERUSER
-)
-
-
-@clear_db_all.handle()
-async def handle_first_receive(matcher: Matcher, args: Message = CommandArg()):
-    plain_text = args.extract_plain_text()
-    if plain_text:
-        matcher.set_arg("confirm", args)
-
-
-@clear_db_all.got("confirm", prompt="该操作将清楚数据库全部内容，是否继续？")
-async def _(yes_or_no: str = ArgPlainText("confirm")):
-    if yes_or_no in CHINESE_AGREE_WORD:
-        MainTable.delete().where(MainTable.target_id).execute()
-        await clear_db.finish("已清理全部数据库")
-    elif yes_or_no in CHINESE_DECLINE_WORD:
-        await clear_db.finish("已取消操作")
-    await clear_db.reject("不太明白你的意思呢")
+# ==========================================
+# 4. 构造转发节点（每条消息一个节点）
+# ==========================================
+def make_forward_node(row: MainTable) -> MessageSegment:
+    """
+    将row的一条消息转换为合并转发节点
+    你自己的 node_custom(...) 里可能需要:
+       user_id: 发送者
+       name: 显示名 (若你不要展示名字，就传空字符串)
+       time: 字符串或整数
+       content: Message 对象
+    """
+    return node_custom(
+        user_id=row.operator_id,  # 要显示原作者
+        name="",                  # 不想出现艾特人名字则留空
+        time=str(row.time),       # 时间戳
+        content=Message(row.message)
+    )
